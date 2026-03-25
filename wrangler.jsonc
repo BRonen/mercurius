@@ -1,0 +1,30 @@
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "agora",
+	"main": "src/index.ts",
+	"compatibility_date": "2025-03-10",
+	"compatibility_flags": [
+		"nodejs_compat"
+	],
+	"assets": {
+		"binding": "ASSETS",
+		"directory": "./public"
+	},
+	"observability": {
+		"enabled": true
+	},
+	"durable_objects":{
+		"bindings": [
+			{
+				"name": "WORKFLOW_DURABLE_OBJECT",
+				"class_name": "WorkflowDO"
+			}
+		]
+	},
+	"migrations": [
+		{
+			"tag": "v1",
+			"new_sqlite_classes": [ "WorkflowDO" ]
+		}
+	]
+}
