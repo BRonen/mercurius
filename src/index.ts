@@ -1,140 +1,189 @@
 import { DurableObject } from "cloudflare:workers";
 import { z } from 'zod';
 
-// TODO: check the step returned statically preventing invalid transitions between states.
-// TODO: add state validator to infer state invariants statically
+type Either<L, R> = { success: false, error: L } | { success: true, data: R };
 
-type Action<State, Step, Schema> = {
-	validator: z.ZodType<Schema>;
-	handler: (state: State, data: Schema) => { state?: State, step?: NoInfer<Step> };
-};
-
-type ActionBuilder<State, Step> = <Schema>(
-	validator: z.ZodType<Schema>,
-	handler: (state: State, data: Schema) => { state?: State; step?: NoInfer<Step> }
-) => ({ validator: typeof validator, handler: typeof handler });
-
-export const createMachine = <
-	State,
-	Step extends string,
-	ActionName extends string,
-	Transitions extends Record<Step, Record<ActionName, Action<State, Step, any>>>
->(
-	config: {
-		initialStep: keyof Transitions,
-		state: State,
-		transitions: (action: ActionBuilder<State, Step>) => Transitions
+const createInvariants = <
+	Invariants extends Record<string, z.ZodType<any>>,
+	Specification extends {
+		[Invariant in keyof Invariants]: ({
+			on: Record<string, (
+				action: <Input, Next extends keyof Invariants = Invariant>(
+					schema: z.ZodType<Input>,
+					handler: (state: z.infer<Invariants[Invariant]>, input: Input) =>
+						Either<any, ({ step?: Next, state?: z.infer<Invariants[Next]> })>
+				) => ReturnType<typeof handler>
+			) => ReturnType<typeof action>>
+		})
 	}
-) => {
-	type TransitionValue = Record<ActionName, Action<State, Step, any>>;
-	// type ActionValue = Action<State, Step, any>;
-
-	const transitions = config.transitions((validator, handler) => ({ validator, handler }));
-	const currentTransitions: TransitionValue = transitions[config.initialStep];
-
-	const dispatch = (action: ActionName, input?: unknown) => {
-		if (!(action in currentTransitions))
-			return {
-				success: false as const,
-				message: 'trying to dispatch an invalid action',
-			};
-
-		const { validator, handler } = currentTransitions[action];
-
-		const inputResult = z.safeParse(validator, input);
-
-		if (!inputResult.success)
-			return {
-				success: false as const,
-				message: 'invalid input for action',
-			};
-
-		const result = handler(config.state, inputResult.data);
-
-		return {
-			success: true as const,
-			data: createMachine<State, Step, ActionName, Transitions>({
-				initialStep: result.step ?? config.initialStep,
-				state: result.state ?? config.state,
-				transitions: config.transitions
-			}),
-		};
-	};
-
+>(invariants: Invariants) => {
 	return {
-		...config,
-		transitions,
-		dispatch
-	}
+		invariants,
+		defineWorkflow: (specification: Specification) => ({
+			invariants,
+			specification,
+			setup: <Step extends keyof Invariants>(
+				current: {
+					step: Step,
+					state: z.infer<Invariants[Step]>
+				}
+			) => ({
+				invariants,
+				specification,
+				current,
+				// TODO: narrow `action` type to accept only the available actions of the current step
+				dispatch: (action: keyof Specification[Step]['on'], input?: unknown) => {
+					const result = specification[current.step].on[action](
+						(schema, handler) => {
+							const inputResult = schema.safeParse(input);
+
+							if (!inputResult.success)
+								return { success: false, error: inputResult.error };
+
+							return handler(current.state, inputResult.data);
+						}
+					);
+
+					if (!result.success)
+						return result;
+
+					const state = result.data.state ?? current.state;
+					const step = result.data.step ?? current.step;
+					const stateResult = invariants[step].safeParse(state);
+
+					if (!stateResult.success)
+						return { success: false as const, error: stateResult.error };
+
+					return {
+						success: true as const,
+						data: createInvariants<Invariants, Specification>(invariants)
+							.defineWorkflow(specification)
+							.setup({ step, state: stateResult.data })
+					};
+				}
+			}),
+		})
+	};
 };
 
 export const createWorkflow = <
-	State,
-	Step extends string,
-	ActionName extends string,
-	Transitions extends Record<Step, Record<string, Action<State, Step, any>>>
->(cfg: Parameters<typeof createMachine<State, Step, ActionName, Transitions>>[0], stepKey?: string, stateKey?: string) =>
-	class DurableWorkflow extends DurableObject {
-		machine: ReturnType<typeof createMachine<State, Step, ActionName, Transitions>>;
+	Invariants extends Record<string, z.ZodType<any>>,
+	Specification extends {
+		[Invariant in keyof Invariants]: ({
+			on: Record<string, (
+				action: <Input, Next extends keyof Invariants = Invariant>(
+					schema: z.ZodType<Input>,
+					handler: (state: z.infer<Invariants[Invariant]>, input: Input) =>
+						Either<any, ({ step?: Next, state?: z.infer<Invariants[Next]> })>
+				) => ReturnType<typeof handler>
+			) => ReturnType<typeof action>>
+		})
+	}
+>(invariants: Invariants) => (spec: Specification) => <InitialStep extends keyof Invariants>(
+	initial: { step: InitialStep, state: z.infer<Invariants[InitialStep]> },
+	opts?: { stepKey?: string, stateKey?: string }
+) => {
+	type CreatedInvariants = ReturnType<typeof createInvariants<Invariants, Specification>>;
+	type DefinedWorkflow = ReturnType<CreatedInvariants['defineWorkflow']>
+	type FullWorkflow = ReturnType<DefinedWorkflow['setup']>
+
+	type Step = keyof Invariants;
+	type State = z.infer<Invariants[Step]>;
+
+	return class DurableWorkflow extends DurableObject {
+		workflow: FullWorkflow;
+
 		stepKey = "__WORKFLOW_STEP_KEY__";
 		stateKey = "__WORKFLOW_STATE_KEY__";
 
 		constructor(state: DurableObjectState, env: Env) {
 			super(state, env);
-			this.machine = createMachine(cfg);
 
-			if (stepKey) this.stepKey = stepKey;
-			if (stateKey) this.stateKey = stateKey;
+			if (opts?.stepKey) this.stepKey = opts.stepKey;
+			if (opts?.stateKey) this.stateKey = opts.stateKey;
+
+			this.workflow = createInvariants<Invariants, Specification>(invariants)
+				.defineWorkflow(spec)
+				.setup(initial);
 
 			state.blockConcurrencyWhile(async () => {
 				const savedStep = await this.ctx.storage.get<Step>(this.stepKey);
 				const savedState = await this.ctx.storage.get<State>(this.stateKey);
 
-				if (savedStep && savedState) {
-					this.machine = createMachine<State, Step, ActionName, Transitions>({
-						initialStep: savedStep,
-						state: savedState,
-						transitions: cfg.transitions
-					});
+				if (!savedStep || !savedState) {
+					return;
 				}
+
+				this.workflow = createInvariants<Invariants, Specification>(invariants)
+					.defineWorkflow(spec)
+					.setup({ step: savedStep, state: savedState });
 			});
 		}
 
-		async dispatch(action: ActionName, input: unknown) {
-			const result = this.machine.dispatch(action, input);
+		// TODO: narrow `action` type to accept only the available actions of the current step
+		async dispatch(action: keyof Specification[Step]['on'], input: unknown) {
+			const result = this.workflow.dispatch(action, input);
 
 			if (!result.success) {
-				throw new Error(result.message);
+				throw new Error(result.error);
 			}
 
-			await this.ctx.storage.put(this.stepKey, result.data.initialStep);
-			await this.ctx.storage.put(this.stateKey, result.data.state);
+			await this.ctx.storage.put<Step>(this.stepKey, result.data.current.step);
+			await this.ctx.storage.put<State>(this.stateKey, result.data.current.state);
 
-			this.machine = result.data;
+			this.workflow = result.data;
 		}
-	};
+	}
+};
 
-export type DurableWorkflowClass = ReturnType<typeof createWorkflow>;
+export type DurableWorkflowClass = ReturnType<ReturnType<ReturnType<typeof createWorkflow>>>;
 export type DurableWorkflowInstance = InstanceType<DurableWorkflowClass>;
 
-export const WorkflowDO = createWorkflow({
-	initialStep: 'unlogged',
-	state: { email: '' },
-	transitions: (action) => ({
-		unlogged: {
-			LOGIN: action(
-				z.object({ email: z.email() }),
-				(_s, data) => ({ step: 'logged', state: { email: data.email } })
-			)
-		},
-		logged: {
-			LOGOUT: action(
-				z.void(),
-				(_s, _d) => ({ step: 'unlogged', state: { email: '' }})
+const authInvariants = createInvariants({
+	unlogged: z.object({ email: z.null() }),
+	logged: z.object({ email: z.email() }),
+});
+
+const authWorkflow = authInvariants.defineWorkflow({
+	unlogged: {
+		on: {
+			LOGIN: (action) => action(
+				z.email(),
+				(_s, data) => ({ success: true, data: { step: 'logged' as const, state: { email: data } } })
 			)
 		}
-	})
+	},
+	logged: {
+		on: {
+			LOGOUT: (action) => action(
+				z.void(),
+				(_s, _d) => ({ success: true, data: { step: 'unlogged', state: { email: null }} })
+			)
+		}
+	}
+}).setup({
+	step: 'unlogged',
+	state: { email: null }
 });
+
+const counterWorkflow = createInvariants({ default: z.number() })
+	.defineWorkflow({
+		default: {
+			on: {
+				INC: (action) => action(
+					z.void(),
+					(state, _d) => ({ success: true, data: { state: state + 1 } })
+				),
+				DEC: (action) => action(
+					z.void(),
+					(state, _d) => ({ success: true, data: { state: state - 1 } })
+				)
+			}
+		},
+	}).setup({
+		step: 'default',
+		state: 0
+	});
 
 export default {
 	async fetch(_req: Request, _env: Env, _ctx: ExecutionContext): Promise<Response> {
