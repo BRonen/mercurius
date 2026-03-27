@@ -3,7 +3,7 @@ import { z } from 'zod';
 
 type Either<L, R> = { success: false, error: L } | { success: true, data: R };
 
-const createInvariants = <
+export const createInvariants = <
 	Invariants extends Record<string, z.ZodType<any>>,
 	Specification extends {
 		[Invariant in keyof Invariants]: ({
@@ -121,7 +121,7 @@ export const createWorkflow = <
 		}
 
 		// TODO: narrow `action` type to accept only the available actions of the current step
-		async dispatch(action: keyof Specification[Step]['on'], input: unknown) {
+		async dispatch(action: keyof Specification[Step]['on'], input?: unknown) {
 			const result = this.workflow.dispatch(action, input);
 
 			if (!result.success) {
@@ -139,12 +139,10 @@ export const createWorkflow = <
 export type DurableWorkflowClass = ReturnType<ReturnType<ReturnType<typeof createWorkflow>>>;
 export type DurableWorkflowInstance = InstanceType<DurableWorkflowClass>;
 
-const authInvariants = createInvariants({
+export const WorkflowDO = createWorkflow({
 	unlogged: z.object({ email: z.null() }),
 	logged: z.object({ email: z.email() }),
-});
-
-const authWorkflow = authInvariants.defineWorkflow({
+})({
 	unlogged: {
 		on: {
 			LOGIN: (action) => action(
@@ -157,33 +155,11 @@ const authWorkflow = authInvariants.defineWorkflow({
 		on: {
 			LOGOUT: (action) => action(
 				z.void(),
-				(_s, _d) => ({ success: true, data: { step: 'unlogged', state: { email: null }} })
+				(_s, _d) => ({ success: true, data: { step: 'unlogged' as const, state: { email: null } } })
 			)
 		}
 	}
-}).setup({
-	step: 'unlogged',
-	state: { email: null }
-});
-
-const counterWorkflow = createInvariants({ default: z.number() })
-	.defineWorkflow({
-		default: {
-			on: {
-				INC: (action) => action(
-					z.void(),
-					(state, _d) => ({ success: true, data: { state: state + 1 } })
-				),
-				DEC: (action) => action(
-					z.void(),
-					(state, _d) => ({ success: true, data: { state: state - 1 } })
-				)
-			}
-		},
-	}).setup({
-		step: 'default',
-		state: 0
-	});
+})({ step: 'unlogged', state: { email: null } });
 
 export default {
 	async fetch(_req: Request, _env: Env, _ctx: ExecutionContext): Promise<Response> {
